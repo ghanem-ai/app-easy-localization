@@ -1,7 +1,8 @@
+import 'dart:async';
+
 import 'package:easy_localization/easy_localization.dart';
 import 'package:flutter/material.dart';
-import 'package:intl/intl_standalone.dart'
-    if (dart.library.html) 'package:intl/intl_browser.dart';
+import 'package:intl/intl_standalone.dart' if (dart.library.html) 'package:intl/intl_browser.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'translations.dart';
@@ -24,6 +25,10 @@ class EasyLocalizationController extends ChangeNotifier {
   Translations? _translations, _fallbackTranslations;
   Translations? get translations => _translations;
   Translations? get fallbackTranslations => _fallbackTranslations;
+  Locale? _translationsLocale;
+  Completer<void>? _pendingLocaleChange;
+  int _loadGeneration = 0;
+  bool _disposed = false;
 
   EasyLocalizationController({
     required List<Locale> supportedLocales,
@@ -105,16 +110,40 @@ class EasyLocalizationController extends ChangeNotifier {
     }
   }
 
-  Future loadTranslations() async {
+  Future<void> loadTranslations() async {
+    await _loadTranslations();
+  }
+
+  /// Reload the current language without changing its selection or saved locale.
+  /// Keep a working translation map if a background reload fails.
+  Future<void> reloadTranslations() async {
+    // A refresh must not replace an in-flight language selection with old data.
+    while (_pendingLocaleChange != null) {
+      await _pendingLocaleChange!.future;
+    }
+    final generation = _loadGeneration + 1;
+    final loaded = await _loadTranslations(
+      preserveLoadedTranslations: _translations != null && _translationsLocale == _locale,
+    );
+    if (loaded && !_disposed && generation == _loadGeneration) {
+      notifyListeners();
+    }
+  }
+
+  Future<bool> _loadTranslations({bool preserveLoadedTranslations = false}) async {
+    if (_disposed) return false;
+    final generation = ++_loadGeneration;
+    final loadingLocale = _locale;
     Map<String, dynamic> data;
     try {
-      data = Map.from(await loadTranslationData(_locale));
-      _translations = Translations(data);
+      data = Map.from(await loadTranslationData(loadingLocale));
+      final translations = Translations(data);
+      Translations? fallbackTranslations;
       if (useFallbackTranslations && _fallbackLocale != null) {
         Map<String, dynamic>? baseLangData;
-        if (_locale.countryCode != null && _locale.countryCode!.isNotEmpty) {
+        if (loadingLocale.countryCode != null && loadingLocale.countryCode!.isNotEmpty) {
           baseLangData = await loadBaseLangTranslationData(
-            Locale(locale.languageCode),
+            Locale(loadingLocale.languageCode),
           );
         }
         data = Map.from(await loadTranslationData(_fallbackLocale!));
@@ -125,13 +154,25 @@ class EasyLocalizationController extends ChangeNotifier {
             data = Map.of(data)..addAll(baseLangData);
           }
         }
-        _fallbackTranslations = Translations(data);
+        fallbackTranslations = Translations(data);
       }
-    } on FlutterError catch (e) {
-      onLoadError(e);
-    } catch (e) {
-      onLoadError(FlutterError(e.toString()));
+      // Only the newest active load may publish, including its fallback map.
+      if (_disposed || generation != _loadGeneration) return false;
+      _translations = translations;
+      _fallbackTranslations = fallbackTranslations;
+      _translationsLocale = loadingLocale;
+      return true;
+    } catch (e, stackTrace) {
+      if (!_disposed && generation == _loadGeneration) {
+        final error = e is FlutterError ? e : FlutterError(e.toString());
+        if (preserveLoadedTranslations) {
+          EasyLocalization.logger.error(error, stackTrace: stackTrace);
+        } else {
+          onLoadError(error);
+        }
+      }
     }
+    return false;
   }
 
   Future<Map<String, dynamic>?> loadBaseLangTranslationData(
@@ -196,16 +237,34 @@ class EasyLocalizationController extends ChangeNotifier {
   Locale get locale => _locale;
 
   Future<void> setLocale(Locale l) async {
-    _locale = l;
-    await loadTranslations();
-    notifyListeners();
-    EasyLocalization.logger('Locale $locale changed');
-    await _saveLocale(_locale);
+    if (_disposed) return;
+    final pending = Completer<void>();
+    _pendingLocaleChange = pending;
+    try {
+      _locale = l;
+      final generation = _loadGeneration + 1;
+      final loaded = await _loadTranslations();
+      if (_disposed || _locale != l) return;
+      if (loaded && generation == _loadGeneration) notifyListeners();
+      EasyLocalization.logger('Locale $locale changed');
+      await _saveLocale(l);
+    } finally {
+      pending.complete();
+      if (identical(_pendingLocaleChange, pending)) _pendingLocaleChange = null;
+    }
+  }
+
+  @override
+  void dispose() {
+    _disposed = true;
+    _loadGeneration++;
+    super.dispose();
   }
 
   Future<void> _saveLocale(Locale? locale) async {
     if (!saveLocale) return;
     final preferences = await SharedPreferences.getInstance();
+    if (_disposed || locale != _locale) return;
     await preferences.setString('locale', locale.toString());
     EasyLocalization.logger('Locale $locale saved');
   }

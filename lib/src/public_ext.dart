@@ -133,6 +133,10 @@ extension BuildContextEasyLocalizationExtension on BuildContext {
   Future<void> setLocale(Locale val) async =>
       EasyLocalization.of(this)!.setLocale(val);
 
+  /// Reload the current language from the configured asset loaders.
+  Future<void> reloadTranslations() =>
+      EasyLocalization.of(this)!.reloadTranslations();
+
   /// Old Change app locale
   @Deprecated(
       'This is the func used in the old version of EasyLocalization. The modern func is `setLocale(val)` . '
